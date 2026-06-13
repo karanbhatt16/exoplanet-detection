@@ -1,0 +1,18 @@
+# Exoplanet Detection Pipeline
+
+This project builds a modular AI pipeline to detect and classify exoplanet transit-like signals in noisy TESS light curves.
+
+## Current focus
+- Dataset inspection and preview
+- Light-curve ingestion from TESS or local files
+- Clean modular structure by responsibility
+
+## First utility
+Preview a local light-curve file or download a TESS target by TIC ID:
+
+```powershell
+& ".venv/Scripts/python.exe" preview_dataset.py --path path/to/file.csv
+& ".venv/Scripts/python.exe" preview_dataset.py --target-id 123456789 --sector 1
+```
+
+The preview will print a readable summary and save a plot in `artifacts/dataset_preview.png` by default.
