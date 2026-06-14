@@ -7,6 +7,14 @@ This project builds a modular AI pipeline to detect and classify exoplanet trans
 - Light-curve ingestion from TESS or local files
 - Clean modular structure by responsibility
 
+## Transit search
+Search for periodic dips and estimate the strongest candidate period using BLS:
+
+```powershell
+& ".venv/Scripts/python.exe" search_transits.py --target-id 123456789 --all-sectors --show
+& ".venv/Scripts/python.exe" search_transits.py --path .\your_lightcurve.fits --show
+```
+
 ## First utility
 Preview a local light-curve file or download a TESS target by TIC ID:
 
