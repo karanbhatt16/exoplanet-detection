@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from astropy import units as u
 from astropy.timeseries import BoxLeastSquares
+from matplotlib.figure import Figure
 from lightkurve import LightCurve, LightCurveCollection, search_lightcurve
 from lightkurve.utils import LightkurveError
 
@@ -30,6 +31,20 @@ class TransitCandidate:
     stats: dict[str, Any] = field(default_factory=dict)
     periodogram_periods: np.ndarray | None = None
     periodogram_power: np.ndarray | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class TransitAssessment:
+    """Result of vetting a BLS transit candidate."""
+
+    source: str
+    candidate: TransitCandidate | None
+    confidence_percent: float
+    is_candidate: bool
+    status: str
+    reason: str
+    metrics: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
 
@@ -108,16 +123,16 @@ class TransitSearcher:
             return [cleaned, numeric] if numeric else [cleaned]
         return [f"TIC {cleaned}", cleaned]
 
-    def analyze_path(self, path: str | Path) -> TransitCandidate:
+    def analyze_path(self, path: str | Path) -> TransitAssessment:
         preview = self.inspector.load_local(path)
         lightcurve = self._preview_to_lightcurve(preview)
         return self.analyze_lightcurve(lightcurve, preview.source)
 
-    def analyze_remote(self) -> TransitCandidate:
+    def analyze_remote(self) -> TransitAssessment:
         lightcurve, source = self.load_target()
         return self.analyze_lightcurve(lightcurve, source)
 
-    def analyze_lightcurve(self, lightcurve: LightCurve, source: str) -> TransitCandidate:
+    def analyze_lightcurve(self, lightcurve: LightCurve, source: str) -> TransitAssessment:
         prepared = self.prepare_lightcurve(lightcurve)
         time = self._values(prepared.time)
         flux = self._values(prepared.flux)
@@ -151,16 +166,25 @@ class TransitSearcher:
         best_transit_time = float(periodogram.transit_time[candidate_index])
         best_power = float(periodogram.power[candidate_index])
 
-        stats = bls.compute_stats(best_period, best_duration, best_transit_time)
-        depth = self._extract_depth(periodogram, candidate_index, stats)
-        snr = self._extract_snr(stats, best_power)
+        best_period, best_transit_time, best_power, stats, depth, snr, alias_note = self._refine_period_alias(
+            bls=bls,
+            best_period=best_period,
+            best_duration=best_duration,
+            best_transit_time=best_transit_time,
+            best_power=best_power,
+        )
+        confidence_percent, is_candidate, status, reason, metrics = self._vet_candidate(
+            periodogram, candidate_index, stats, best_power, depth, snr
+        )
 
         notes = [
             "BLS search evaluated multiple trial durations and selected the strongest periodogram peak.",
         ]
         if self.use_all_sectors:
             notes.append("All available TESS sectors were requested to extend the time baseline for periodic dip detection.")
-        return TransitCandidate(
+        if alias_note is not None:
+            notes.append(alias_note)
+        candidate = TransitCandidate(
             source=source,
             period=best_period,
             duration=best_duration,
@@ -171,6 +195,28 @@ class TransitSearcher:
             stats=stats,
             periodogram_periods=np.asarray(periodogram.period),
             periodogram_power=np.asarray(periodogram.power),
+            notes=notes,
+        )
+        if not is_candidate:
+            return TransitAssessment(
+                source=source,
+                candidate=None,
+                confidence_percent=confidence_percent,
+                is_candidate=False,
+                status=status,
+                reason=reason,
+                metrics=metrics,
+                notes=notes + [reason],
+            )
+        candidate.notes.extend([f"Estimated exoplanet likelihood: {confidence_percent:.1f}%"])
+        return TransitAssessment(
+            source=source,
+            candidate=candidate,
+            confidence_percent=confidence_percent,
+            is_candidate=True,
+            status=status,
+            reason=reason,
+            metrics=metrics,
             notes=notes,
         )
 
@@ -187,19 +233,8 @@ class TransitSearcher:
         flattened = normalized.flatten(window_length=window_length, polyorder=2)
         return flattened
 
-    def plot_candidate(self, candidate: TransitCandidate, output_path: str | Path | None = None, show: bool = False) -> Path | None:
-        fig, axes = plt.subplots(3, 1, figsize=(12, 11), constrained_layout=True)
-
-        source_lc = self._load_source_lightcurve(candidate.source)
-        prepared = self.prepare_lightcurve(source_lc)
-        time = self._values(prepared.time)
-        flux = self._values(prepared.flux)
-
-        self._plot_time_series(axes[0], time, flux, candidate)
-        self._plot_periodogram(axes[1], candidate)
-        self._plot_phase_folded(axes[2], time, flux, candidate)
-
-        fig.suptitle(f"Transit candidate search: {candidate.source}", fontsize=14)
+    def plot_candidate(self, assessment: TransitAssessment, output_path: str | Path | None = None, show: bool = False) -> Path | None:
+        fig = self.build_result_figure(assessment)
 
         if output_path is not None:
             output = Path(output_path)
@@ -214,25 +249,104 @@ class TransitSearcher:
         plt.close(fig)
         return output
 
-    def summarize(self, candidate: TransitCandidate) -> str:
-        lines = [
-            f"Source: {candidate.source}",
-            f"Best period: {candidate.period:.6f} days",
-            f"Best duration: {candidate.duration:.6f} days",
-            f"Transit time: {candidate.transit_time:.6f} days",
-            f"Estimated depth: {candidate.depth}",
-            f"BLS power: {candidate.power:.4f}",
-            f"Signal significance / SNR: {candidate.snr}",
-        ]
-        if candidate.stats:
-            lines.append("Stats:")
-            for key, value in candidate.stats.items():
-                if isinstance(value, np.ndarray):
-                    continue
+    def build_result_figure(self, assessment: TransitAssessment, source_lightcurve: LightCurve | None = None) -> Figure:
+        if assessment.candidate is None:
+            return self._build_no_candidate_figure(assessment, source_lightcurve=source_lightcurve)
+        return self.build_candidate_figure(assessment.candidate, source_lightcurve=source_lightcurve)
+
+    def build_candidate_figure(self, candidate: TransitCandidate, source_lightcurve: LightCurve | None = None) -> Figure:
+        fig, axes = plt.subplots(3, 1, figsize=(12, 11), constrained_layout=True)
+
+        source_lc = source_lightcurve if source_lightcurve is not None else self._load_source_lightcurve(candidate.source)
+        prepared = self.prepare_lightcurve(source_lc)
+        time = self._values(prepared.time)
+        flux = self._values(prepared.flux)
+
+        self._plot_time_series(axes[0], time, flux, candidate)
+        self._plot_periodogram(axes[1], candidate)
+        self._plot_phase_folded(axes[2], time, flux, candidate)
+
+        fig.suptitle(f"Transit candidate search: {candidate.source}", fontsize=14)
+        return fig
+
+    def _build_no_candidate_figure(self, assessment: TransitAssessment, source_lightcurve: LightCurve | None = None) -> Figure:
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), constrained_layout=True)
+        source_lc = source_lightcurve if source_lightcurve is not None else self._load_source_lightcurve(assessment.source)
+        prepared = self.prepare_lightcurve(source_lc)
+        time = self._values(prepared.time)
+        flux = self._values(prepared.flux)
+
+        axes[0].plot(time, flux, color="#1f77b4", lw=1)
+        axes[0].set_xlabel("Time")
+        axes[0].set_ylabel("Normalized flux")
+        axes[0].set_title("Light curve")
+        axes[0].grid(True, alpha=0.25)
+
+        axes[1].axis("off")
+        axes[1].text(
+            0.5,
+            0.65,
+            "No transit candidates or exoplanets detected",
+            ha="center",
+            va="center",
+            fontsize=15,
+            fontweight="bold",
+        )
+        axes[1].text(
+            0.5,
+            0.40,
+            f"Reason: {assessment.reason}",
+            ha="center",
+            va="center",
+            fontsize=11,
+            wrap=True,
+        )
+        axes[1].text(
+            0.5,
+            0.15,
+            f"Estimated likelihood: {assessment.confidence_percent:.1f}%",
+            ha="center",
+            va="center",
+            fontsize=11,
+        )
+        fig.suptitle(f"Transit search: {assessment.source}", fontsize=14)
+        return fig
+
+    def summarize(self, assessment: TransitAssessment) -> str:
+        if assessment.is_candidate:
+            likelihood_line = f"Estimated exoplanet likelihood: {assessment.confidence_percent:.1f}%"
+        else:
+            likelihood_line = "Estimated exoplanet likelihood: negligible"
+        lines = [f"Source: {assessment.source}", likelihood_line]
+        lines.append(f"Status: {assessment.status}")
+        if assessment.candidate is None:
+            lines.append("Result: No transit candidates or exoplanets detected.")
+            lines.append(f"Reason: {assessment.reason}")
+        else:
+            candidate = assessment.candidate
+            lines.extend(
+                [
+                    f"Best period: {candidate.period:.6f} days",
+                    f"Best duration: {candidate.duration:.6f} days",
+                    f"Transit time: {candidate.transit_time:.6f} days",
+                    f"Estimated depth: {candidate.depth}",
+                    f"BLS power: {candidate.power:.4f}",
+                    f"Signal significance / SNR: {candidate.snr}",
+                ]
+            )
+            if candidate.stats:
+                lines.append("Stats:")
+                for key, value in candidate.stats.items():
+                    if isinstance(value, np.ndarray):
+                        continue
+                    lines.append(f"- {key}: {value}")
+        if assessment.metrics:
+            lines.append("Vet metrics:")
+            for key, value in assessment.metrics.items():
                 lines.append(f"- {key}: {value}")
-        if candidate.notes:
+        if assessment.notes:
             lines.append("Notes:")
-            lines.extend([f"- {note}" for note in candidate.notes])
+            lines.extend([f"- {note}" for note in assessment.notes])
         return "\n".join(lines)
 
     def _load_source_lightcurve(self, source: str) -> LightCurve:
@@ -389,4 +503,146 @@ class TransitSearcher:
                 except Exception:
                     pass
         return float(fallback)
+
+    def _vet_candidate(
+        self,
+        periodogram: Any,
+        index: int,
+        stats: dict[str, Any],
+        best_power: float,
+        depth: float | None,
+        snr: float | None,
+    ) -> tuple[float, bool, str, str, dict[str, Any]]:
+        power_values = np.asarray(periodogram.power, dtype=float)
+        finite_power = power_values[np.isfinite(power_values)]
+        if len(finite_power) == 0:
+            return 0.0, False, "Rejected", "No finite BLS power values were available.", {}
+
+        baseline = float(np.nanmedian(finite_power))
+        mad = float(np.nanmedian(np.abs(finite_power - baseline)))
+        spread = 1.4826 * mad if mad > 0 else float(np.nanstd(finite_power))
+        spread = spread if np.isfinite(spread) and spread > 0 else 1.0
+        prominence = (best_power - baseline) / spread
+        ratio = best_power / (abs(baseline) + 1e-9)
+        depth_snr = float(snr) if snr is not None and np.isfinite(snr) else 0.0
+
+        def sigmoid(x: float) -> float:
+            return 1.0 / (1.0 + np.exp(-x))
+
+        score = (
+            0.5 * sigmoid((depth_snr - 6.0) / 2.0)
+            + 0.3 * sigmoid((prominence - 5.0) / 1.5)
+            + 0.2 * sigmoid((ratio - 1.5) / 0.7)
+        )
+        raw_confidence_percent = float(np.clip(score * 100.0, 0.0, 99.9))
+
+        metrics = {
+            "depth_snr": depth_snr,
+            "peak_prominence_sigma": round(float(prominence), 3),
+            "peak_to_background_ratio": round(float(ratio), 3),
+            "baseline_power": round(float(baseline), 3),
+            "power_spread": round(float(spread), 3),
+            "raw_confidence_percent": round(raw_confidence_percent, 1),
+        }
+
+        if depth_snr < 6.0 or prominence < 5.0 or raw_confidence_percent < 35.0:
+            reason = "The strongest BLS peak is too weak above the noise floor to count as a convincing transit candidate."
+            return 0.0, False, "No convincing candidate", reason, metrics
+
+        confidence_percent = raw_confidence_percent
+
+        if confidence_percent >= 80.0:
+            status = "Strong candidate"
+        elif confidence_percent >= 55.0:
+            status = "Moderate candidate"
+        else:
+            status = "Weak candidate"
+
+        if depth is None:
+            metrics["estimated_depth"] = "unavailable"
+        return confidence_percent, True, status, "The BLS peak is sufficiently above the noise floor to treat as a transit candidate.", metrics
+
+    def _refine_period_alias(
+        self,
+        bls: BoxLeastSquares,
+        best_period: float,
+        best_duration: float,
+        best_transit_time: float,
+        best_power: float,
+    ) -> tuple[float, float, float, dict[str, Any], float | None, float | None, str | None]:
+        alias_candidates: list[float] = [best_period]
+        half_period = best_period / 2.0
+        double_period = best_period * 2.0
+        if self.min_period <= half_period <= self.max_period:
+            alias_candidates.append(half_period)
+        if self.min_period <= double_period <= self.max_period:
+            alias_candidates.append(double_period)
+
+        evaluated: list[dict[str, Any]] = []
+        for period in alias_candidates:
+            alias_result = bls.power(np.asarray([period]), best_duration, objective="snr")
+            if len(alias_result.power) == 0:
+                continue
+            alias_power = float(alias_result.power[0])
+            alias_transit_time = float(alias_result.transit_time[0])
+            alias_stats = bls.compute_stats(period, best_duration, alias_transit_time)
+            alias_depth = self._extract_depth(alias_result, 0, alias_stats)
+            alias_snr = self._extract_snr(alias_stats, alias_power)
+            depth_odd = alias_stats.get("depth_odd")
+            depth_even = alias_stats.get("depth_even")
+            odd_even_gap = np.inf
+            if depth_odd is not None and depth_even is not None:
+                try:
+                    odd_even_gap = abs(float(depth_odd[0]) - float(depth_even[0]))
+                except Exception:
+                    odd_even_gap = np.inf
+            evaluated.append(
+                {
+                    "period": period,
+                    "power": alias_power,
+                    "transit_time": alias_transit_time,
+                    "stats": alias_stats,
+                    "depth": alias_depth,
+                    "snr": alias_snr,
+                    "odd_even_gap": odd_even_gap,
+                }
+            )
+
+        if not evaluated:
+            return best_period, best_transit_time, best_power, {}, None, None, None
+
+        def candidate_score(item: dict[str, Any]) -> float:
+            power_ratio = item["power"] / (best_power + 1e-12)
+            gap = item["odd_even_gap"]
+            consistency = 1.0 / (1.0 + gap) if np.isfinite(gap) else 0.5
+            shorter_bias = 0.03 if item["period"] < best_period else 0.0
+            return 0.72 * power_ratio + 0.25 * consistency + shorter_bias
+
+        ranked = sorted(evaluated, key=lambda item: (candidate_score(item), -item["period"]), reverse=True)
+        chosen = ranked[0]
+        chosen_score = candidate_score(chosen)
+        best_score = candidate_score(next(item for item in evaluated if item["period"] == best_period))
+
+        if chosen["period"] != best_period and chosen_score >= best_score * 0.98:
+            alias_note = f"Alias check refined the period from {best_period:.6f} to {chosen['period']:.6f} days."
+            return (
+                float(chosen["period"]),
+                float(chosen["transit_time"]),
+                float(chosen["power"]),
+                chosen["stats"],
+                chosen["depth"],
+                chosen["snr"],
+                alias_note,
+            )
+
+        original = next(item for item in evaluated if item["period"] == best_period)
+        return (
+            best_period,
+            best_transit_time,
+            best_power,
+            original["stats"],
+            original["depth"],
+            original["snr"],
+            None,
+        )
 

@@ -40,9 +40,9 @@ def main() -> int:
 
     try:
         if args.path:
-            candidate = searcher.analyze_path(args.path)
+            assessment = searcher.analyze_path(args.path)
         elif args.target_id:
-            candidate = searcher.analyze_remote()
+            assessment = searcher.analyze_remote()
         else:
             parser.error("Provide either --path or --target-id")
             return 2
@@ -50,10 +50,10 @@ def main() -> int:
         print(f"Error: {exc}")
         return 1
 
-    print(searcher.summarize(candidate))
+    print(searcher.summarize(assessment))
 
     if not args.no_plot:
-        output_path = searcher.plot_candidate(candidate, None if args.show else Path(args.output), show=args.show)
+        output_path = searcher.plot_candidate(assessment, None if args.show else Path(args.output), show=args.show)
         if output_path is not None:
             print(f"\nSaved transit search plot to: {output_path}")
 

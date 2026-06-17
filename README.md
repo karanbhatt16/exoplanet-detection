@@ -15,6 +15,13 @@ Search for periodic dips and estimate the strongest candidate period using BLS:
 & ".venv/Scripts/python.exe" search_transits.py --path .\your_lightcurve.fits --show
 ```
 
+## Desktop app
+Launch the GUI to enter a TIC target ID or browse a local light-curve file, then view the result summary and plots in the app:
+
+```powershell
+& ".venv/Scripts/python.exe" exoplanet_gui.py
+```
+
 ## First utility
 Preview a local light-curve file or download a TESS target by TIC ID:
 
