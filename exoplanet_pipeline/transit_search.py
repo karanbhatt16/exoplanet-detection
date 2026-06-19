@@ -14,6 +14,12 @@ from astroquery.mast import Catalogs
 from matplotlib.figure import Figure
 from lightkurve import LightCurve, LightCurveCollection, search_lightcurve
 from lightkurve.utils import LightkurveError
+from scipy.optimize import least_squares
+
+try:
+    import batman
+except Exception:  # pragma: no cover - optional dependency fallback
+    batman = None
 
 from .dataset_inspector import DatasetInspector, DatasetPreview
 
@@ -31,6 +37,8 @@ class TransitCandidate:
     snr: float | None
     stellar_radius_rsun: float | None = None
     stellar_radius_err_rsun: float | None = None
+    stellar_mass_msun: float | None = None
+    stellar_mass_err_msun: float | None = None
     planet_radius_rsun: float | None = None
     planet_radius_err_rsun: float | None = None
     planet_radius_rearth: float | None = None
@@ -71,8 +79,11 @@ class TransitSearcher:
         max_duration: float = 0.3,
         duration_steps: int = 8,
         period_samples: int = 5000,
+        period_power_tolerance: float = 0.97,
         stellar_radius_rsun: float | None = None,
         stellar_radius_err_rsun: float | None = None,
+        stellar_mass_msun: float | None = None,
+        stellar_mass_err_msun: float | None = None,
     ):
         self.target_id = target_id
         self.sector = sector
@@ -83,8 +94,11 @@ class TransitSearcher:
         self.max_duration = max_duration
         self.duration_steps = duration_steps
         self.period_samples = period_samples
+        self.period_power_tolerance = period_power_tolerance
         self.stellar_radius_rsun = stellar_radius_rsun
         self.stellar_radius_err_rsun = stellar_radius_err_rsun
+        self.stellar_mass_msun = stellar_mass_msun
+        self.stellar_mass_err_msun = stellar_mass_err_msun
         self.inspector = DatasetInspector(target_id=target_id, sector=sector)
 
     def load_target(self) -> tuple[LightCurve, str]:
@@ -147,8 +161,11 @@ class TransitSearcher:
 
     def analyze_lightcurve(self, lightcurve: LightCurve, source: str) -> TransitAssessment:
         prepared = self.prepare_lightcurve(lightcurve)
+        radius_prepared = self.prepare_radius_lightcurve(lightcurve)
         time = self._values(prepared.time)
         flux = self._values(prepared.flux)
+        radius_time = self._values(radius_prepared.time)
+        radius_flux = self._values(radius_prepared.flux)
         flux_err = self._values(prepared.flux_err) if getattr(prepared, "flux_err", None) is not None else None
         if flux_err is not None and np.isfinite(flux_err).sum() == 0:
             flux_err = None
@@ -175,9 +192,7 @@ class TransitSearcher:
             raise RuntimeError("Could not evaluate any BLS candidates for the supplied light curve")
 
         bls, periodogram, candidate_index = best_result
-        best_period = float(periodogram.period[candidate_index])
-        best_transit_time = float(periodogram.transit_time[candidate_index])
-        best_power = float(periodogram.power[candidate_index])
+        best_period, best_transit_time, best_power, period_note = self._choose_period_solution(periodogram)
 
         best_period, best_transit_time, best_power, stats, depth, snr, alias_note = self._refine_period_alias(
             bls=bls,
@@ -186,6 +201,16 @@ class TransitSearcher:
             best_transit_time=best_transit_time,
             best_power=best_power,
         )
+        refined_depth, depth_err, depth_note = self._refine_transit_depth(
+            radius_time, radius_flux, best_period, best_transit_time, best_duration, depth
+        )
+        if refined_depth is not None:
+            depth = refined_depth
+            stats = dict(stats)
+            stats["depth"] = (depth, depth_err) if depth_err is not None else depth
+            if depth_note is not None:
+                stats["depth_note"] = depth_note
+
         confidence_percent, is_candidate, status, reason, metrics = self._vet_candidate(
             periodogram, candidate_index, stats, best_power, depth, snr
         )
@@ -193,13 +218,27 @@ class TransitSearcher:
         notes = [
             "BLS search evaluated multiple trial durations and selected the strongest periodogram peak.",
         ]
+        if period_note is not None:
+            notes.append(period_note)
         if self.use_all_sectors:
             notes.append("All available TESS sectors were requested to extend the time baseline for periodic dip detection.")
         if alias_note is not None:
             notes.append(alias_note)
-        stellar_radius_rsun, stellar_radius_err_rsun, radius_source = self._resolve_stellar_radius(source)
+        stellar_radius_rsun, stellar_radius_err_rsun, stellar_mass_msun, stellar_mass_err_msun, radius_source = self._resolve_stellar_properties(source)
         planet_radius_rsun, planet_radius_err_rsun, planet_radius_rearth, planet_radius_err_rearth, radius_ratio = (
-            self._estimate_planet_radius(depth, stats, stellar_radius_rsun, stellar_radius_err_rsun)
+            self._estimate_planet_radius(
+                radius_time,
+                radius_flux,
+                depth,
+                stats,
+                best_period,
+                best_transit_time,
+                best_duration,
+                stellar_radius_rsun,
+                stellar_radius_err_rsun,
+                stellar_mass_msun,
+                stellar_mass_err_msun,
+            )
         )
 
         candidate = TransitCandidate(
@@ -212,6 +251,8 @@ class TransitSearcher:
             snr=snr,
             stellar_radius_rsun=stellar_radius_rsun,
             stellar_radius_err_rsun=stellar_radius_err_rsun,
+            stellar_mass_msun=stellar_mass_msun,
+            stellar_mass_err_msun=stellar_mass_err_msun,
             planet_radius_rsun=planet_radius_rsun,
             planet_radius_err_rsun=planet_radius_err_rsun,
             planet_radius_rearth=planet_radius_rearth,
@@ -224,22 +265,19 @@ class TransitSearcher:
             notes=notes,
         )
         if not is_candidate:
-            return TransitAssessment(
-                source=source,
-                candidate=None,
-                confidence_percent=confidence_percent,
-                is_candidate=False,
-                status=status,
-                reason=reason,
-                metrics=self._augment_radius_metrics(metrics, stellar_radius_rsun, stellar_radius_err_rsun, planet_radius_rearth, planet_radius_err_rearth),
-                notes=notes + [reason],
+            candidate.notes.extend(
+                [
+                    "This is the closest BLS candidate, but the signal is weak and should be treated cautiously.",
+                    reason,
+                ]
             )
-        candidate.notes.extend([f"Estimated exoplanet likelihood: {confidence_percent:.1f}%"])
+        else:
+            candidate.notes.extend([f"Estimated exoplanet likelihood: {confidence_percent:.1f}%"])
         return TransitAssessment(
             source=source,
             candidate=candidate,
             confidence_percent=confidence_percent,
-            is_candidate=True,
+            is_candidate=is_candidate,
             status=status,
             reason=reason,
             metrics=self._augment_radius_metrics(metrics, stellar_radius_rsun, stellar_radius_err_rsun, planet_radius_rearth, planet_radius_err_rearth),
@@ -259,6 +297,16 @@ class TransitSearcher:
         flattened = normalized.flatten(window_length=window_length, polyorder=2)
         return flattened
 
+    def prepare_radius_lightcurve(self, lightcurve: LightCurve) -> LightCurve:
+        cleaned = lightcurve.remove_nans()
+        if len(cleaned) == 0:
+            raise RuntimeError("The light curve has no finite cadences after removing NaNs")
+
+        if len(cleaned) > 20:
+            cleaned = cleaned.remove_outliers(sigma=7)
+
+        return cleaned.normalize()
+
     def plot_candidate(self, assessment: TransitAssessment, output_path: str | Path | None = None, show: bool = False) -> Path | None:
         fig = self.build_result_figure(assessment)
 
@@ -276,116 +324,269 @@ class TransitSearcher:
         return output
 
     def build_result_figure(self, assessment: TransitAssessment, source_lightcurve: LightCurve | None = None) -> Figure:
-        if assessment.candidate is None:
-            return self._build_no_candidate_figure(assessment, source_lightcurve=source_lightcurve)
-        return self.build_candidate_figure(assessment.candidate, source_lightcurve=source_lightcurve)
+        return self.build_dashboard_figure(assessment, source_lightcurve=source_lightcurve)
 
     def build_candidate_figure(self, candidate: TransitCandidate, source_lightcurve: LightCurve | None = None) -> Figure:
-        fig, axes = plt.subplots(3, 1, figsize=(12, 11), constrained_layout=True)
-
-        source_lc = source_lightcurve if source_lightcurve is not None else self._load_source_lightcurve(candidate.source)
-        prepared = self.prepare_lightcurve(source_lc)
-        time = self._values(prepared.time)
-        flux = self._values(prepared.flux)
-
-        self._plot_time_series(axes[0], time, flux, candidate)
-        self._plot_periodogram(axes[1], candidate)
-        self._plot_phase_folded(axes[2], time, flux, candidate)
-
-        fig.suptitle(f"Transit candidate search: {candidate.source}", fontsize=14)
+        fig = self.build_dashboard_figure(
+            TransitAssessment(
+                source=candidate.source,
+                candidate=candidate,
+                confidence_percent=0.0,
+                is_candidate=True,
+                status="Candidate",
+                reason="",
+                metrics={},
+                notes=[],
+            ),
+            source_lightcurve=source_lightcurve,
+        )
         return fig
 
-    def _build_no_candidate_figure(self, assessment: TransitAssessment, source_lightcurve: LightCurve | None = None) -> Figure:
-        fig, axes = plt.subplots(2, 1, figsize=(12, 8), constrained_layout=True)
+    def build_dashboard_figure(self, assessment: TransitAssessment, source_lightcurve: LightCurve | None = None) -> Figure:
+        fig = plt.figure(figsize=(18, 10), facecolor="#081018")
+        fig.subplots_adjust(left=0.03, right=0.985, top=0.92, bottom=0.08, wspace=0.18, hspace=0.22)
+        gs = fig.add_gridspec(2, 3)
+
+        raw_ax = fig.add_subplot(gs[0, 0])
+        pipeline_ax = fig.add_subplot(gs[0, 1])
+        summary_ax = fig.add_subplot(gs[0, 2])
+        denoised_ax = fig.add_subplot(gs[1, 0])
+        score_ax = fig.add_subplot(gs[1, 1])
+        phase_ax = fig.add_subplot(gs[1, 2])
+
+        axes = [raw_ax, pipeline_ax, summary_ax, denoised_ax, score_ax, phase_ax]
+        for axis in axes:
+            axis.set_facecolor("#0d1520")
+            axis.tick_params(colors="#dbe7f3", labelsize=8)
+            for spine in axis.spines.values():
+                spine.set_color("#2f4158")
+
         source_lc = source_lightcurve if source_lightcurve is not None else self._load_source_lightcurve(assessment.source)
-        prepared = self.prepare_lightcurve(source_lc)
-        time = self._values(prepared.time)
-        flux = self._values(prepared.flux)
+        raw_lc = self.prepare_radius_lightcurve(source_lc)
+        denoised_lc = self.prepare_lightcurve(source_lc)
 
-        axes[0].plot(time, flux, color="#1f77b4", lw=1)
-        axes[0].set_xlabel("Time")
-        axes[0].set_ylabel("Normalized flux")
-        axes[0].set_title("Light curve")
-        axes[0].grid(True, alpha=0.25)
+        raw_time = self._values(raw_lc.time)
+        raw_flux = self._values(raw_lc.flux)
+        den_time = self._values(denoised_lc.time)
+        den_flux = self._values(denoised_lc.flux)
 
-        axes[1].axis("off")
-        axes[1].text(
+        candidate = assessment.candidate
+        if candidate is None:
+            candidate = TransitCandidate(
+                source=assessment.source,
+                period=1.0,
+                duration=1.0 / 24.0,
+                transit_time=float(raw_time[0]) if len(raw_time) else 0.0,
+                depth=None,
+                power=0.0,
+                snr=None,
+            )
+
+        self._plot_raw_lightcurve_card(raw_ax, raw_time, raw_flux, candidate, assessment)
+        self._plot_pipeline_card(pipeline_ax, assessment)
+        self._plot_summary_card(summary_ax, assessment)
+        self._plot_denoised_card(denoised_ax, den_time, den_flux, candidate)
+        self._plot_score_card(score_ax, candidate)
+        self._plot_phase_folded_card(phase_ax, den_time, den_flux, candidate)
+
+        fig.text(
             0.5,
-            0.65,
-            "No transit candidates or exoplanets detected",
+            0.015,
+            "Exoplanet transit search dashboard",
             ha="center",
-            va="center",
-            fontsize=15,
+            va="bottom",
+            color="white",
+            fontsize=16,
             fontweight="bold",
         )
-        axes[1].text(
-            0.5,
-            0.40,
-            f"Reason: {assessment.reason}",
-            ha="center",
-            va="center",
-            fontsize=11,
-            wrap=True,
-        )
-        axes[1].text(
-            0.5,
-            0.15,
-            f"Estimated likelihood: {assessment.confidence_percent:.1f}%",
-            ha="center",
-            va="center",
-            fontsize=11,
-        )
-        fig.suptitle(f"Transit search: {assessment.source}", fontsize=14)
         return fig
 
+    def _status_color(self, assessment: TransitAssessment) -> str:
+        if assessment.candidate is None or assessment.confidence_percent < 35.0:
+            return "#ff5c77"
+        if assessment.confidence_percent < 80.0:
+            return "#f5c542"
+        return "#4ade80"
+
+    def _plot_raw_lightcurve_card(
+        self,
+        axis: Any,
+        time: np.ndarray,
+        flux: np.ndarray,
+        candidate: TransitCandidate,
+        assessment: TransitAssessment,
+    ) -> None:
+        axis.plot(time, flux, color="#e8eef7", lw=0.8, alpha=0.9)
+        axis.scatter(time[:: max(len(time) // 250, 1)], flux[:: max(len(flux) // 250, 1)], s=4, color="#d7deea", alpha=0.5)
+        transit_centers = self._transit_centers(time, candidate.period, candidate.transit_time)
+        for center in transit_centers:
+            axis.axvline(center, color="#f59e0b", alpha=0.15, lw=1)
+        axis.set_title("1. Noisy Light Curve", loc="left", color="#9ad1ff", fontsize=12, fontweight="bold")
+        axis.set_xlabel("Time (days)", color="#dbe7f3")
+        axis.set_ylabel("Relative Flux", color="#dbe7f3")
+        axis.grid(True, alpha=0.18, color="#2f4158")
+        axis.text(
+            0.01,
+            0.94,
+            "Raw flux measurements over time",
+            transform=axis.transAxes,
+            color="#aab8c7",
+            fontsize=9,
+            va="top",
+        )
+
+    def _plot_pipeline_card(self, axis: Any, assessment: TransitAssessment) -> None:
+        axis.set_axis_off()
+        axis.set_title("2. AI Pipeline", loc="left", color="#9ad1ff", fontsize=12, fontweight="bold")
+        axis.text(0.02, 0.92, "Deep learning style workflow for transit detection", color="#aab8c7", fontsize=9, transform=axis.transAxes)
+
+        boxes = [
+            (0.03, 0.40, 0.16, 0.32, "Input\nNoisy\nLight Curve"),
+            (0.24, 0.40, 0.16, 0.32, "Denoising\nFlattening"),
+            (0.45, 0.40, 0.16, 0.32, "Feature\nExtraction"),
+            (0.66, 0.40, 0.16, 0.32, "Transit\nDetection"),
+            (0.87, 0.40, 0.10, 0.32, f"Output\n{assessment.confidence_percent:.2f}%"),
+        ]
+        for idx, (x, y, w, h, label) in enumerate(boxes):
+            rect = plt.Rectangle((x, y), w, h, transform=axis.transAxes, facecolor="#0b1320", edgecolor="#38506a", lw=1.2)
+            axis.add_patch(rect)
+            axis.text(x + w / 2, y + h / 2, label, color="white", ha="center", va="center", fontsize=9, transform=axis.transAxes)
+            if idx < len(boxes) - 1:
+                axis.annotate(
+                    "",
+                    xy=(x + w + 0.01, y + h / 2),
+                    xytext=(x + w + 0.055, y + h / 2),
+                    xycoords=axis.transAxes,
+                    textcoords=axis.transAxes,
+                    arrowprops=dict(arrowstyle="->", color="#7aa2d6", lw=1.2),
+                )
+
+        axis.text(
+            0.5,
+            0.12,
+            "Transit Detected" if assessment.confidence_percent >= 35.0 else "Weak Candidate",
+            color=self._status_color(assessment),
+            fontsize=14,
+            fontweight="bold",
+            ha="center",
+            transform=axis.transAxes,
+        )
+
+    def _plot_summary_card(self, axis: Any, assessment: TransitAssessment) -> None:
+        axis.set_axis_off()
+        axis.set_title("3. Detection Result", loc="left", color="#9ad1ff", fontsize=12, fontweight="bold")
+        candidate = assessment.candidate
+        status_color = self._status_color(assessment)
+        status_text = assessment.status if candidate is not None else "No Candidate"
+        lines = [
+            f"Status: {status_text}",
+            f"Confidence: {assessment.confidence_percent:.2f}%",
+            f"Period: {candidate.period:.4f} days" if candidate else "Period: n/a",
+            f"Depth: {candidate.depth:.4f}" if candidate and candidate.depth is not None else "Depth: n/a",
+            f"Duration: {candidate.duration * 24.0:.2f} hours" if candidate else "Duration: n/a",
+            f"Radius: {candidate.planet_radius_rearth:.2f} R_earth" if candidate and candidate.planet_radius_rearth is not None else "Radius: n/a",
+        ]
+        axis.text(
+            0.05,
+            0.86,
+            lines[0],
+            color=status_color,
+            fontsize=14,
+            fontweight="bold",
+            transform=axis.transAxes,
+        )
+        for index, line in enumerate(lines[1:], start=1):
+            axis.text(0.06, 0.86 - index * 0.13, f"• {line}", color="#dbe7f3", fontsize=10, transform=axis.transAxes)
+
+    def _plot_denoised_card(self, axis: Any, time: np.ndarray, flux: np.ndarray, candidate: TransitCandidate) -> None:
+        axis.plot(time, flux, color="#5eead4", lw=0.9)
+        axis.set_title("4. Model Denoised Light Curve", loc="left", color="#9ad1ff", fontsize=12, fontweight="bold")
+        axis.set_xlabel("Time (days)", color="#dbe7f3")
+        axis.set_ylabel("Relative Flux", color="#dbe7f3")
+        axis.grid(True, alpha=0.18, color="#2f4158")
+        transit_centers = self._transit_centers(time, candidate.period, candidate.transit_time)
+        for center in transit_centers:
+            axis.axvline(center, color="#22d3ee", alpha=0.12, lw=1)
+
+    def _plot_score_card(self, axis: Any, candidate: TransitCandidate) -> None:
+        axis.set_title("5. Transit Probability / Score", loc="left", color="#9ad1ff", fontsize=12, fontweight="bold")
+        periods = candidate.periodogram_periods if candidate.periodogram_periods is not None else np.asarray([])
+        powers = candidate.periodogram_power if candidate.periodogram_power is not None else np.asarray([])
+        if len(periods) and len(powers):
+            finite = np.isfinite(periods) & np.isfinite(powers)
+            periods = periods[finite]
+            powers = powers[finite]
+        if len(periods) == 0 or len(powers) == 0:
+            axis.text(0.5, 0.5, "No periodogram available", color="#dbe7f3", ha="center", va="center", transform=axis.transAxes)
+            axis.set_axis_off()
+            return
+        min_power = float(np.nanmin(powers))
+        max_power = float(np.nanmax(powers))
+        norm = (powers - min_power) / (max(max_power - min_power, 1e-9))
+        axis.plot(periods, norm, color="#a855f7", lw=1.1, label="Normalized BLS score")
+        axis.axvline(candidate.period, color="#f59e0b", lw=1.1, ls="--", label="Selected period")
+        axis.axhline(0.5, color="#ff6b6b", lw=1.0, ls=":", label="Threshold")
+        axis.set_xlabel("Period (days)", color="#dbe7f3")
+        axis.set_ylabel("Score", color="#dbe7f3")
+        axis.grid(True, alpha=0.18, color="#2f4158")
+        axis.legend(loc="upper right", fontsize=8, facecolor="#0d1520", edgecolor="#2f4158")
+
+    def _plot_phase_folded_card(self, axis: Any, time: np.ndarray, flux: np.ndarray, candidate: TransitCandidate) -> None:
+        phase = ((time - candidate.transit_time + 0.5 * candidate.period) % candidate.period) - 0.5 * candidate.period
+        axis.scatter(phase, flux, s=8, color="#67e8f9", alpha=0.7, edgecolors="none", label="Data")
+        half_duration = candidate.duration / 2.0
+        axis.axvspan(-half_duration, half_duration, color="#f59e0b", alpha=0.12, label="Transit Window")
+        axis.set_title("6. Phase-folded Light Curve", loc="left", color="#9ad1ff", fontsize=12, fontweight="bold")
+        axis.set_xlabel("Phase (days)", color="#dbe7f3")
+        axis.set_ylabel("Relative Flux", color="#dbe7f3")
+        axis.grid(True, alpha=0.18, color="#2f4158")
+        axis.legend(loc="best", fontsize=8, facecolor="#0d1520", edgecolor="#2f4158")
+
     def summarize(self, assessment: TransitAssessment) -> str:
-        if assessment.is_candidate:
-            likelihood_line = f"Estimated exoplanet likelihood: {assessment.confidence_percent:.1f}%"
-        else:
-            likelihood_line = "Estimated exoplanet likelihood: negligible"
-        lines = [f"Source: {assessment.source}", likelihood_line]
+        lines = [f"Source: {assessment.source}", f"Estimated exoplanet likelihood: {assessment.confidence_percent:.1f}%"]
         lines.append(f"Status: {assessment.status}")
-        if assessment.candidate is None:
-            lines.append("Result: No transit candidates or exoplanets detected.")
+        candidate = assessment.candidate
+        if candidate is None:
+            lines.append("Result: No candidate object was produced.")
             lines.append(f"Reason: {assessment.reason}")
-        else:
-            candidate = assessment.candidate
-            lines.extend(
-                [
-                    f"Best period: {candidate.period:.6f} days",
-                    f"Best duration: {candidate.duration:.6f} days",
-                    f"Transit time: {candidate.transit_time:.6f} days",
-                    f"Estimated depth: {candidate.depth}",
-                    f"BLS power: {candidate.power:.4f}",
-                    f"Signal significance / SNR: {candidate.snr}",
-                ]
-            )
-            if candidate.radius_ratio is not None:
-                lines.append(f"Radius ratio (Rp/Rs): {candidate.radius_ratio:.5f}")
-            if candidate.stellar_radius_rsun is not None:
-                if candidate.stellar_radius_err_rsun is not None:
-                    lines.append(
-                        f"Stellar radius: {candidate.stellar_radius_rsun:.4f} +/- {candidate.stellar_radius_err_rsun:.4f} R_sun"
-                    )
-                else:
-                    lines.append(f"Stellar radius: {candidate.stellar_radius_rsun:.4f} R_sun")
-            if candidate.planet_radius_rearth is not None:
-                if candidate.planet_radius_err_rearth is not None:
-                    lines.append(
-                        f"Estimated planet radius: {candidate.planet_radius_rearth:.3f} +/- {candidate.planet_radius_err_rearth:.3f} R_earth"
-                    )
-                else:
-                    lines.append(f"Estimated planet radius: {candidate.planet_radius_rearth:.3f} R_earth")
-            elif candidate.planet_radius_rsun is not None:
-                lines.append(f"Estimated planet radius: {candidate.planet_radius_rsun:.5f} R_sun")
-            if candidate.radius_source is not None:
-                lines.append(f"Radius source: {candidate.radius_source}")
-            if candidate.stats:
-                lines.append("Stats:")
-                for key, value in candidate.stats.items():
-                    if isinstance(value, np.ndarray):
-                        continue
-                    lines.append(f"- {key}: {value}")
+            return "\n".join(lines)
+
+        lines.extend(
+            [
+                f"Best period: {candidate.period:.6f} days",
+                f"Best duration: {candidate.duration * 24.0:.3f} hours",
+                f"Transit time: {candidate.transit_time:.6f} days",
+                f"Estimated depth: {candidate.depth}",
+                f"BLS power: {candidate.power:.4f}",
+                f"Signal significance / SNR: {candidate.snr}",
+            ]
+        )
+        if candidate.radius_ratio is not None:
+            lines.append(f"Radius ratio (Rp/Rs): {candidate.radius_ratio:.5f}")
+        if candidate.stellar_radius_rsun is not None:
+            if candidate.stellar_radius_err_rsun is not None:
+                lines.append(
+                    f"Stellar radius: {candidate.stellar_radius_rsun:.4f} +/- {candidate.stellar_radius_err_rsun:.4f} R_sun"
+                )
+            else:
+                lines.append(f"Stellar radius: {candidate.stellar_radius_rsun:.4f} R_sun")
+        if candidate.planet_radius_rearth is not None:
+            if candidate.planet_radius_err_rearth is not None:
+                lines.append(
+                    f"Estimated planet radius: {candidate.planet_radius_rearth:.3f} +/- {candidate.planet_radius_err_rearth:.3f} R_earth"
+                )
+            else:
+                lines.append(f"Estimated planet radius: {candidate.planet_radius_rearth:.3f} R_earth")
+        elif candidate.planet_radius_rsun is not None:
+            lines.append(f"Estimated planet radius: {candidate.planet_radius_rsun:.5f} R_sun")
+        if candidate.radius_source is not None:
+            lines.append(f"Radius source: {candidate.radius_source}")
+        if candidate.stats:
+            lines.append("Stats:")
+            for key, value in candidate.stats.items():
+                if isinstance(value, np.ndarray):
+                    continue
+                lines.append(f"- {key}: {value}")
         if assessment.metrics:
             lines.append("Vet metrics:")
             for key, value in assessment.metrics.items():
@@ -550,18 +751,26 @@ class TransitSearcher:
                     pass
         return float(fallback)
 
-    def _resolve_stellar_radius(self, source: str) -> tuple[float | None, float | None, str | None]:
+    def _resolve_stellar_properties(
+        self, source: str
+    ) -> tuple[float | None, float | None, float | None, float | None, str | None]:
         if self.stellar_radius_rsun is not None and self.stellar_radius_rsun > 0:
-            return self.stellar_radius_rsun, self.stellar_radius_err_rsun, "manual input"
+            return (
+                self.stellar_radius_rsun,
+                self.stellar_radius_err_rsun,
+                self.stellar_mass_msun,
+                self.stellar_mass_err_msun,
+                "manual input",
+            )
 
         tic_id = self._extract_tic_id(source)
         if tic_id is None:
-            return None, None, None
+            return None, None, None, None, None
 
         try:
             table = Catalogs.query_object(f"TIC {tic_id}", catalog="Tic")
         except Exception:
-            return None, None, None
+            return None, None, None, None, None
 
         for row in table:
             try:
@@ -572,10 +781,12 @@ class TransitSearcher:
 
             stellar_radius = self._safe_float(row.get("rad"))
             stellar_radius_err = self._safe_float(row.get("e_rad"))
+            stellar_mass = self._safe_float(row.get("mass"))
+            stellar_mass_err = self._safe_float(row.get("e_mass"))
             if stellar_radius is not None and stellar_radius > 0:
-                return stellar_radius, stellar_radius_err, "TIC catalog"
+                return stellar_radius, stellar_radius_err, stellar_mass, stellar_mass_err, "TIC catalog"
 
-        return None, None, None
+        return None, None, None, None, None
 
     @staticmethod
     def _extract_tic_id(source: str) -> int | None:
@@ -609,10 +820,17 @@ class TransitSearcher:
 
     def _estimate_planet_radius(
         self,
+        time: np.ndarray,
+        flux: np.ndarray,
         depth: float | None,
         stats: dict[str, Any],
+        period: float,
+        transit_time: float,
+        duration: float,
         stellar_radius_rsun: float | None,
         stellar_radius_err_rsun: float | None,
+        stellar_mass_msun: float | None,
+        stellar_mass_err_msun: float | None,
     ) -> tuple[float | None, float | None, float | None, float | None, float | None]:
         if depth is None or depth <= 0:
             return None, None, None, None, None
@@ -620,6 +838,19 @@ class TransitSearcher:
             return None, None, None, None, None
 
         radius_ratio = float(np.sqrt(depth))
+        fitted_ratio = self._fit_radius_ratio_with_batman(
+            time=time,
+            flux=flux,
+            period=period,
+            transit_time=transit_time,
+            duration=duration,
+            stellar_radius_rsun=stellar_radius_rsun,
+            stellar_mass_msun=stellar_mass_msun,
+            initial_radius_ratio=radius_ratio,
+        )
+        if fitted_ratio is not None:
+            radius_ratio = fitted_ratio
+
         planet_radius_rsun = stellar_radius_rsun * radius_ratio
 
         planet_radius_err_rsun = None
@@ -645,6 +876,135 @@ class TransitSearcher:
             planet_radius_err_rearth = float((planet_radius_err_rsun * u.R_sun).to(u.R_earth).value)
 
         return planet_radius_rsun, planet_radius_err_rsun, planet_radius_rearth, planet_radius_err_rearth, radius_ratio
+
+    def _fit_radius_ratio_with_batman(
+        self,
+        time: np.ndarray,
+        flux: np.ndarray,
+        period: float,
+        transit_time: float,
+        duration: float,
+        stellar_radius_rsun: float,
+        stellar_mass_msun: float | None,
+        initial_radius_ratio: float,
+    ) -> float | None:
+        if batman is None or stellar_mass_msun is None or stellar_mass_msun <= 0:
+            return None
+
+        finite = np.isfinite(time) & np.isfinite(flux)
+        if not np.any(finite):
+            return None
+
+        phase = ((time - transit_time + 0.5 * period) % period) - 0.5 * period
+        window = np.abs(phase) <= max(duration * 2.5, duration + 0.1)
+        mask = finite & window
+        if int(np.sum(mask)) < 50:
+            mask = finite
+        if int(np.sum(mask)) < 30:
+            return None
+
+        fit_time = time[mask]
+        fit_flux = flux[mask]
+
+        from astropy.constants import G, M_sun, R_sun
+
+        period_seconds = period * 86400.0
+        a_m = ((G.value * stellar_mass_msun * M_sun.value * period_seconds**2) / (4.0 * np.pi**2)) ** (1.0 / 3.0)
+        a_rs = a_m / (stellar_radius_rsun * R_sun.value)
+        if not np.isfinite(a_rs) or a_rs <= 1.0:
+            return None
+
+        params = batman.TransitParams()
+        params.t0 = transit_time
+        params.per = period
+        params.rp = float(np.clip(initial_radius_ratio, 0.005, 0.4))
+        params.a = float(a_rs)
+        params.inc = 89.0
+        params.ecc = 0.0
+        params.w = 90.0
+        params.u = [0.3, 0.2]
+        params.limb_dark = "quadratic"
+        model = batman.TransitModel(params, fit_time)
+
+        def residuals(values: np.ndarray) -> np.ndarray:
+            rp, inc, offset = values
+            params.rp = float(np.clip(rp, 0.001, 0.8))
+            params.inc = float(np.clip(inc, 75.0, 90.0))
+            return model.light_curve(params) + offset - fit_flux
+
+        initial = np.asarray([params.rp, params.inc, 0.0], dtype=float)
+        bounds = ([0.001, 75.0, -0.05], [0.8, 90.0, 0.05])
+        try:
+            result = least_squares(residuals, initial, bounds=bounds, max_nfev=200)
+        except Exception:
+            return None
+
+        if not result.success:
+            return None
+
+        fitted_rp = float(result.x[0])
+        if not np.isfinite(fitted_rp) or fitted_rp <= 0:
+            return None
+        return fitted_rp
+
+    @staticmethod
+    def _refine_transit_depth(
+        time: np.ndarray,
+        flux: np.ndarray,
+        period: float,
+        transit_time: float,
+        duration: float,
+        fallback_depth: float | None,
+    ) -> tuple[float | None, float | None, str | None]:
+        if fallback_depth is None or fallback_depth <= 0:
+            return None, None, None
+        if len(time) == 0 or len(flux) == 0:
+            return fallback_depth, None, None
+
+        phase = ((time - transit_time + 0.5 * period) % period) - 0.5 * period
+        candidates: list[tuple[float, float | None, float, float]] = []
+        for fraction in (0.35, 0.5, 0.65, 0.8, 1.0, 1.2):
+            window = duration * fraction
+            in_mask = np.isfinite(flux) & (np.abs(phase) <= window / 2.0)
+            out_mask = np.isfinite(flux) & (np.abs(phase) >= window)
+
+            if int(np.sum(in_mask)) < 5 or int(np.sum(out_mask)) < 20:
+                continue
+
+            in_flux = flux[in_mask]
+            out_flux = flux[out_mask]
+            baseline = float(np.nanmedian(out_flux))
+            in_level = float(np.nanmedian(in_flux))
+            refined_depth = baseline - in_level
+
+            if not np.isfinite(refined_depth) or refined_depth <= 0:
+                continue
+
+            out_mad = float(np.nanmedian(np.abs(out_flux - baseline)))
+            in_mad = float(np.nanmedian(np.abs(in_flux - in_level)))
+            out_sigma = 1.4826 * out_mad if out_mad > 0 else float(np.nanstd(out_flux))
+            in_sigma = 1.4826 * in_mad if in_mad > 0 else float(np.nanstd(in_flux))
+            out_sigma = out_sigma if np.isfinite(out_sigma) and out_sigma > 0 else 0.0
+            in_sigma = in_sigma if np.isfinite(in_sigma) and in_sigma > 0 else 0.0
+
+            depth_err = None
+            if out_sigma > 0 or in_sigma > 0:
+                depth_err = float(
+                    np.sqrt(
+                        (out_sigma**2 / max(int(np.sum(out_mask)), 1))
+                        + (in_sigma**2 / max(int(np.sum(in_mask)), 1))
+                    )
+                )
+            score = refined_depth / (depth_err if depth_err is not None and depth_err > 0 else refined_depth * 1e-3)
+            candidates.append((refined_depth, depth_err, fraction, score))
+
+        if not candidates:
+            return fallback_depth, None, None
+
+        candidates.sort(key=lambda item: (item[3], item[0]), reverse=True)
+        refined_depth, depth_err, fraction, _score = candidates[0]
+        note = f"Transit depth was refined from folded flux to {refined_depth:.6f} using a {fraction:.2f}x transit window."
+        return refined_depth, depth_err, note
 
     @staticmethod
     def _augment_radius_metrics(
@@ -707,8 +1067,8 @@ class TransitSearcher:
         }
 
         if depth_snr < 6.0 or prominence < 5.0 or raw_confidence_percent < 35.0:
-            reason = "The strongest BLS peak is too weak above the noise floor to count as a convincing transit candidate."
-            return 0.0, False, "No convincing candidate", reason, metrics
+            reason = "The strongest BLS peak is weak above the noise floor, so this is only a tentative candidate."
+            return raw_confidence_percent, False, "Weak candidate", reason, metrics
 
         confidence_percent = raw_confidence_percent
 
@@ -806,4 +1166,36 @@ class TransitSearcher:
             original["snr"],
             None,
         )
+
+    def _choose_period_solution(self, periodogram: Any) -> tuple[float, float, float, str | None]:
+        power = np.asarray(periodogram.power, dtype=float)
+        periods = np.asarray(periodogram.period, dtype=float)
+        transit_times = np.asarray(periodogram.transit_time, dtype=float)
+        finite = np.isfinite(power) & np.isfinite(periods) & np.isfinite(transit_times)
+        if not np.any(finite):
+            raise RuntimeError("No finite periodogram peaks were available")
+
+        finite_power = power[finite]
+        max_power = float(np.nanmax(finite_power))
+        argmax_index = int(np.nanargmax(power))
+
+        near_best = finite & (power >= max_power * self.period_power_tolerance)
+        if np.any(near_best):
+            candidate_indices = np.where(near_best)[0]
+            chosen_index = int(candidate_indices[np.argmax(periods[candidate_indices])])
+            if chosen_index != argmax_index:
+                note = (
+                    f"Period preference selected a longer near-equal peak at {periods[chosen_index]:.6f} days "
+                    f"instead of the tallest peak at {periods[argmax_index]:.6f} days."
+                )
+            else:
+                note = None
+            return (
+                float(periods[chosen_index]),
+                float(transit_times[chosen_index]),
+                float(power[chosen_index]),
+                note,
+            )
+
+        return float(periods[argmax_index]), float(transit_times[argmax_index]), float(power[argmax_index]), None
 

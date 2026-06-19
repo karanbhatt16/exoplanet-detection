@@ -14,8 +14,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-period", type=float, default=0.5, help="Minimum trial period in days.")
     parser.add_argument("--all-sectors", action="store_true", help="Ignore sector filtering and stitch all available TESS sectors for the longest baseline.")
     parser.add_argument("--max-period", type=float, default=20.0, help="Maximum trial period in days.")
-    parser.add_argument("--min-duration", type=float, default=0.05, help="Minimum trial duration in days.")
-    parser.add_argument("--max-duration", type=float, default=0.3, help="Maximum trial duration in days.")
+    parser.add_argument("--min-duration", type=float, default=1.2, help="Minimum trial duration in hours.")
+    parser.add_argument("--max-duration", type=float, default=7.2, help="Maximum trial duration in hours.")
     parser.add_argument("--duration-steps", type=int, default=8, help="Number of trial durations for BLS search.")
     parser.add_argument("--stellar-radius", type=float, default=None, help="Optional stellar radius in solar radii for planet-radius estimation.")
     parser.add_argument("--stellar-radius-err", type=float, default=None, help="Optional stellar radius uncertainty in solar radii.")
@@ -35,8 +35,8 @@ def main() -> int:
         use_all_sectors=args.all_sectors,
         min_period=args.min_period,
         max_period=args.max_period,
-        min_duration=args.min_duration,
-        max_duration=args.max_duration,
+        min_duration=args.min_duration / 24.0,
+        max_duration=args.max_duration / 24.0,
         duration_steps=args.duration_steps,
         stellar_radius_rsun=args.stellar_radius,
         stellar_radius_err_rsun=args.stellar_radius_err,
