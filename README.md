@@ -22,6 +22,8 @@ Launch the GUI to enter a TIC target ID or browse a local light-curve file, then
 & ".venv/Scripts/python.exe" exoplanet_gui.py
 ```
 
+You can also provide an optional stellar radius to improve the planet-radius estimate. For TESS targets, the app will try to pull the radius from the TIC catalog automatically.
+
 ## First utility
 Preview a local light-curve file or download a TESS target by TIC ID:
 

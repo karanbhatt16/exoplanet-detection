@@ -17,6 +17,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-duration", type=float, default=0.05, help="Minimum trial duration in days.")
     parser.add_argument("--max-duration", type=float, default=0.3, help="Maximum trial duration in days.")
     parser.add_argument("--duration-steps", type=int, default=8, help="Number of trial durations for BLS search.")
+    parser.add_argument("--stellar-radius", type=float, default=None, help="Optional stellar radius in solar radii for planet-radius estimation.")
+    parser.add_argument("--stellar-radius-err", type=float, default=None, help="Optional stellar radius uncertainty in solar radii.")
     parser.add_argument("--output", type=str, default="artifacts/transit_candidate.png", help="Output plot path.")
     parser.add_argument("--show", action="store_true", help="Display the plot interactively.")
     parser.add_argument("--no-plot", action="store_true", help="Skip plotting.")
@@ -36,6 +38,8 @@ def main() -> int:
         min_duration=args.min_duration,
         max_duration=args.max_duration,
         duration_steps=args.duration_steps,
+        stellar_radius_rsun=args.stellar_radius,
+        stellar_radius_err_rsun=args.stellar_radius_err,
     )
 
     try:

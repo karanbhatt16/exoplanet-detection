@@ -33,6 +33,8 @@ class ExoplanetApp(tk.Tk):
         self.min_duration_var = tk.StringVar(value="0.05")
         self.max_duration_var = tk.StringVar(value="0.3")
         self.duration_steps_var = tk.StringVar(value="8")
+        self.stellar_radius_var = tk.StringVar()
+        self.stellar_radius_err_var = tk.StringVar()
         self.status_var = tk.StringVar(value="Ready")
 
         self._canvas: FigureCanvasTkAgg | None = None
@@ -88,9 +90,11 @@ class ExoplanetApp(tk.Tk):
         self._add_labeled_entry(settings, "Min duration", self.min_duration_var, 1, 0)
         self._add_labeled_entry(settings, "Max duration", self.max_duration_var, 1, 2)
         self._add_labeled_entry(settings, "Duration steps", self.duration_steps_var, 0, 4, width=10)
+        self._add_labeled_entry(settings, "Stellar radius (Rsun)", self.stellar_radius_var, 2, 0)
+        self._add_labeled_entry(settings, "Radius error (Rsun)", self.stellar_radius_err_var, 2, 2)
 
         self._run_button = ttk.Button(settings, text="Run Search", command=self._run_search)
-        self._run_button.grid(row=0, column=6, rowspan=2, padx=12, pady=8, sticky="ns")
+        self._run_button.grid(row=0, column=6, rowspan=3, padx=12, pady=8, sticky="ns")
 
         output = ttk.Frame(self)
         output.grid(row=2, column=0, sticky="nsew", padx=12, pady=12)
@@ -215,6 +219,10 @@ class ExoplanetApp(tk.Tk):
             min_duration = float(self.min_duration_var.get().strip())
             max_duration = float(self.max_duration_var.get().strip())
             duration_steps = int(self.duration_steps_var.get().strip())
+            stellar_radius = float(self.stellar_radius_var.get().strip()) if self.stellar_radius_var.get().strip() else None
+            stellar_radius_err = (
+                float(self.stellar_radius_err_var.get().strip()) if self.stellar_radius_err_var.get().strip() else None
+            )
         except ValueError as exc:
             messagebox.showerror("Invalid input", f"Please check the numeric settings.\n\n{exc}")
             return
@@ -247,6 +255,8 @@ class ExoplanetApp(tk.Tk):
                 min_duration=min_duration,
                 max_duration=max_duration,
                 duration_steps=duration_steps,
+                stellar_radius_rsun=stellar_radius,
+                stellar_radius_err_rsun=stellar_radius_err,
                 use_all_sectors=self.use_all_sectors_var.get(),
             ),
             daemon=True,
@@ -264,6 +274,8 @@ class ExoplanetApp(tk.Tk):
                 min_duration=kwargs["min_duration"],
                 max_duration=kwargs["max_duration"],
                 duration_steps=kwargs["duration_steps"],
+                stellar_radius_rsun=kwargs["stellar_radius_rsun"],
+                stellar_radius_err_rsun=kwargs["stellar_radius_err_rsun"],
             )
 
             preview_text = ""

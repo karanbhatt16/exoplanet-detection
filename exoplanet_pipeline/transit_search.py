@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from astropy import units as u
 from astropy.timeseries import BoxLeastSquares
+from astroquery.mast import Catalogs
 from matplotlib.figure import Figure
 from lightkurve import LightCurve, LightCurveCollection, search_lightcurve
 from lightkurve.utils import LightkurveError
@@ -28,6 +29,14 @@ class TransitCandidate:
     depth: float | None
     power: float
     snr: float | None
+    stellar_radius_rsun: float | None = None
+    stellar_radius_err_rsun: float | None = None
+    planet_radius_rsun: float | None = None
+    planet_radius_err_rsun: float | None = None
+    planet_radius_rearth: float | None = None
+    planet_radius_err_rearth: float | None = None
+    radius_ratio: float | None = None
+    radius_source: str | None = None
     stats: dict[str, Any] = field(default_factory=dict)
     periodogram_periods: np.ndarray | None = None
     periodogram_power: np.ndarray | None = None
@@ -62,6 +71,8 @@ class TransitSearcher:
         max_duration: float = 0.3,
         duration_steps: int = 8,
         period_samples: int = 5000,
+        stellar_radius_rsun: float | None = None,
+        stellar_radius_err_rsun: float | None = None,
     ):
         self.target_id = target_id
         self.sector = sector
@@ -72,6 +83,8 @@ class TransitSearcher:
         self.max_duration = max_duration
         self.duration_steps = duration_steps
         self.period_samples = period_samples
+        self.stellar_radius_rsun = stellar_radius_rsun
+        self.stellar_radius_err_rsun = stellar_radius_err_rsun
         self.inspector = DatasetInspector(target_id=target_id, sector=sector)
 
     def load_target(self) -> tuple[LightCurve, str]:
@@ -184,6 +197,11 @@ class TransitSearcher:
             notes.append("All available TESS sectors were requested to extend the time baseline for periodic dip detection.")
         if alias_note is not None:
             notes.append(alias_note)
+        stellar_radius_rsun, stellar_radius_err_rsun, radius_source = self._resolve_stellar_radius(source)
+        planet_radius_rsun, planet_radius_err_rsun, planet_radius_rearth, planet_radius_err_rearth, radius_ratio = (
+            self._estimate_planet_radius(depth, stats, stellar_radius_rsun, stellar_radius_err_rsun)
+        )
+
         candidate = TransitCandidate(
             source=source,
             period=best_period,
@@ -192,6 +210,14 @@ class TransitSearcher:
             depth=depth,
             power=best_power,
             snr=snr,
+            stellar_radius_rsun=stellar_radius_rsun,
+            stellar_radius_err_rsun=stellar_radius_err_rsun,
+            planet_radius_rsun=planet_radius_rsun,
+            planet_radius_err_rsun=planet_radius_err_rsun,
+            planet_radius_rearth=planet_radius_rearth,
+            planet_radius_err_rearth=planet_radius_err_rearth,
+            radius_ratio=radius_ratio,
+            radius_source=radius_source,
             stats=stats,
             periodogram_periods=np.asarray(periodogram.period),
             periodogram_power=np.asarray(periodogram.power),
@@ -205,7 +231,7 @@ class TransitSearcher:
                 is_candidate=False,
                 status=status,
                 reason=reason,
-                metrics=metrics,
+                metrics=self._augment_radius_metrics(metrics, stellar_radius_rsun, stellar_radius_err_rsun, planet_radius_rearth, planet_radius_err_rearth),
                 notes=notes + [reason],
             )
         candidate.notes.extend([f"Estimated exoplanet likelihood: {confidence_percent:.1f}%"])
@@ -216,7 +242,7 @@ class TransitSearcher:
             is_candidate=True,
             status=status,
             reason=reason,
-            metrics=metrics,
+            metrics=self._augment_radius_metrics(metrics, stellar_radius_rsun, stellar_radius_err_rsun, planet_radius_rearth, planet_radius_err_rearth),
             notes=notes,
         )
 
@@ -334,6 +360,26 @@ class TransitSearcher:
                     f"Signal significance / SNR: {candidate.snr}",
                 ]
             )
+            if candidate.radius_ratio is not None:
+                lines.append(f"Radius ratio (Rp/Rs): {candidate.radius_ratio:.5f}")
+            if candidate.stellar_radius_rsun is not None:
+                if candidate.stellar_radius_err_rsun is not None:
+                    lines.append(
+                        f"Stellar radius: {candidate.stellar_radius_rsun:.4f} +/- {candidate.stellar_radius_err_rsun:.4f} R_sun"
+                    )
+                else:
+                    lines.append(f"Stellar radius: {candidate.stellar_radius_rsun:.4f} R_sun")
+            if candidate.planet_radius_rearth is not None:
+                if candidate.planet_radius_err_rearth is not None:
+                    lines.append(
+                        f"Estimated planet radius: {candidate.planet_radius_rearth:.3f} +/- {candidate.planet_radius_err_rearth:.3f} R_earth"
+                    )
+                else:
+                    lines.append(f"Estimated planet radius: {candidate.planet_radius_rearth:.3f} R_earth")
+            elif candidate.planet_radius_rsun is not None:
+                lines.append(f"Estimated planet radius: {candidate.planet_radius_rsun:.5f} R_sun")
+            if candidate.radius_source is not None:
+                lines.append(f"Radius source: {candidate.radius_source}")
             if candidate.stats:
                 lines.append("Stats:")
                 for key, value in candidate.stats.items():
@@ -503,6 +549,121 @@ class TransitSearcher:
                 except Exception:
                     pass
         return float(fallback)
+
+    def _resolve_stellar_radius(self, source: str) -> tuple[float | None, float | None, str | None]:
+        if self.stellar_radius_rsun is not None and self.stellar_radius_rsun > 0:
+            return self.stellar_radius_rsun, self.stellar_radius_err_rsun, "manual input"
+
+        tic_id = self._extract_tic_id(source)
+        if tic_id is None:
+            return None, None, None
+
+        try:
+            table = Catalogs.query_object(f"TIC {tic_id}", catalog="Tic")
+        except Exception:
+            return None, None, None
+
+        for row in table:
+            try:
+                if int(row["ID"]) != int(tic_id):
+                    continue
+            except Exception:
+                continue
+
+            stellar_radius = self._safe_float(row.get("rad"))
+            stellar_radius_err = self._safe_float(row.get("e_rad"))
+            if stellar_radius is not None and stellar_radius > 0:
+                return stellar_radius, stellar_radius_err, "TIC catalog"
+
+        return None, None, None
+
+    @staticmethod
+    def _extract_tic_id(source: str) -> int | None:
+        match = re.search(r"(?:TIC\s*)?(\d{6,})", str(source), flags=re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            if np.ma.is_masked(value):
+                return None
+        except Exception:
+            pass
+        try:
+            value_str = str(value).strip()
+            if not value_str or value_str == "--":
+                return None
+            converted = float(value)
+            if not np.isfinite(converted):
+                return None
+            return converted
+        except Exception:
+            return None
+
+    def _estimate_planet_radius(
+        self,
+        depth: float | None,
+        stats: dict[str, Any],
+        stellar_radius_rsun: float | None,
+        stellar_radius_err_rsun: float | None,
+    ) -> tuple[float | None, float | None, float | None, float | None, float | None]:
+        if depth is None or depth <= 0:
+            return None, None, None, None, None
+        if stellar_radius_rsun is None or stellar_radius_rsun <= 0:
+            return None, None, None, None, None
+
+        radius_ratio = float(np.sqrt(depth))
+        planet_radius_rsun = stellar_radius_rsun * radius_ratio
+
+        planet_radius_err_rsun = None
+        depth_err = None
+        depth_info = stats.get("depth")
+        if isinstance(depth_info, (tuple, list)) and len(depth_info) >= 2:
+            try:
+                depth_err = float(depth_info[1])
+            except Exception:
+                depth_err = None
+
+        relative_terms: list[float] = []
+        if depth_err is not None and depth_err > 0:
+            relative_terms.append(0.5 * (depth_err / depth))
+        if stellar_radius_err_rsun is not None and stellar_radius_err_rsun > 0:
+            relative_terms.append(stellar_radius_err_rsun / stellar_radius_rsun)
+        if relative_terms:
+            planet_radius_err_rsun = planet_radius_rsun * float(np.sqrt(np.sum(np.square(relative_terms))))
+
+        planet_radius_rearth = float((planet_radius_rsun * u.R_sun).to(u.R_earth).value)
+        planet_radius_err_rearth = None
+        if planet_radius_err_rsun is not None:
+            planet_radius_err_rearth = float((planet_radius_err_rsun * u.R_sun).to(u.R_earth).value)
+
+        return planet_radius_rsun, planet_radius_err_rsun, planet_radius_rearth, planet_radius_err_rearth, radius_ratio
+
+    @staticmethod
+    def _augment_radius_metrics(
+        metrics: dict[str, Any],
+        stellar_radius_rsun: float | None,
+        stellar_radius_err_rsun: float | None,
+        planet_radius_rearth: float | None,
+        planet_radius_err_rearth: float | None,
+    ) -> dict[str, Any]:
+        enriched = dict(metrics)
+        if stellar_radius_rsun is not None:
+            enriched["stellar_radius_rsun"] = round(float(stellar_radius_rsun), 5)
+        if stellar_radius_err_rsun is not None:
+            enriched["stellar_radius_err_rsun"] = round(float(stellar_radius_err_rsun), 5)
+        if planet_radius_rearth is not None:
+            enriched["planet_radius_rearth"] = round(float(planet_radius_rearth), 5)
+        if planet_radius_err_rearth is not None:
+            enriched["planet_radius_err_rearth"] = round(float(planet_radius_err_rearth), 5)
+        return enriched
 
     def _vet_candidate(
         self,
