@@ -33,3 +33,26 @@ Preview a local light-curve file or download a TESS target by TIC ID:
 ```
 
 The preview will print a readable summary and save a plot in `artifacts/dataset_preview.png` by default.
+
+## Project Setup (For developers)
+- Clone the repository and *cd* to cloned folder.
+1. Backend Setup
+    - *cd* in backend folder.
+    - Create a virtual environment `python -m venv myenv`
+    - Activate the virtual environment `.\myenv\Scripts\activate`
+    - Install requirements `pip install -r requirements.txt`
+    - Start app.py (web server) `python app.py` or `.\myenv\Scripts\python.exe app.py`
+
+2. Start frontend
+    - *cd* in frontend folder.
+    - run `npm i` to install dependencies.
+    - start project `npm run start`
+    Note: Proxy is setup in package.json so it will connect frontend to backend during development automatically.
+    Note: Visit the url given by `npm run start` not the one given my running app.py since it's development level.
+
+3. Build/Production
+    - *cd* in frontend folder.
+    - Build the react application `npm run build`
+    - *cd* in backend folder.
+    - Start app.py (web server) `python app.py` or `.\myenv\Scripts\python.exe app.py`
+    - Visit the url given by app.py
