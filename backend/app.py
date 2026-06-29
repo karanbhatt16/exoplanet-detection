@@ -18,7 +18,7 @@ from werkzeug.utils import secure_filename
 
 from exoplanet_pipeline import TransitAssessment, TransitCandidate, TransitSearcher
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder="../frontend/build", static_folder="../frontend/build", static_url_path="")
 
 ALLOWED_SUFFIXES = {".csv", ".txt", ".parquet", ".fits", ".fit", ".lc"}
 
@@ -144,7 +144,8 @@ def _analyze(searcher: TransitSearcher, source_mode: str, upload_path: Path | No
 
 
 @app.get("/")
-def index():
+@app.get("/:path")
+def index(*args):
     return render_template("index.html")
 
 

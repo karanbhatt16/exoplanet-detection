@@ -103,12 +103,15 @@ Develop a robust AI-driven pipeline that detects periodic dips in noisy light cu
 - Modular code structure with separate components for ingest, preprocess, detect, classify, and report.
 
 ## 6. Suggested Technical Stack
+### Backend & Data
 - Python 3.11+
 - numpy, scipy, pandas
 - astropy, lightkurve, astroquery
 - scikit-learn, xgboost/lightgbm
 - matplotlib/seaborn
 - optional advanced: transitleastsquares, pymc, exoplanet
+### Frontend
+- react js
 
 ## 7. Acceptance Criteria
 
