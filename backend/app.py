@@ -4,6 +4,7 @@ import base64
 import io
 import tempfile
 import uuid
+import os
 from pathlib import Path
 from typing import Any
 
@@ -13,10 +14,17 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import numpy as np
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.utils import secure_filename
 
 from exoplanet_pipeline import TransitAssessment, TransitCandidate, TransitSearcher
+
+def _setup_file_system():
+    # This will setup required file/folder structure in backend if not exists.
+    if not os.path.exists("figures-dir"):
+        os.mkdir("figures-dir")
+
+_setup_file_system() # Should run before app starts.
 
 app = Flask(__name__, template_folder="../frontend/build", static_folder="../frontend/build", static_url_path="")
 
@@ -24,6 +32,8 @@ ALLOWED_SUFFIXES = {".csv", ".txt", ".parquet", ".fits", ".fit", ".lc"}
 
 
 def _to_python(value: Any) -> Any:
+    if value == np.inf:
+        return "Infinity"
     if isinstance(value, np.generic):
         return value.item()
     if isinstance(value, np.ndarray):
@@ -142,10 +152,8 @@ def _analyze(searcher: TransitSearcher, source_mode: str, upload_path: Path | No
     assessment = searcher.analyze_lightcurve(lightcurve, source)
     return assessment, lightcurve, source
 
-
 @app.get("/")
-@app.get("/:path")
-def index(*args):
+def index():
     return render_template("index.html")
 
 
@@ -179,9 +187,12 @@ def analyze():
 
     try:
         assessment, lightcurve, source = _analyze(searcher, source_mode, upload_path)
-        figure = searcher.build_result_figure(assessment, source_lightcurve=lightcurve)
         summary_text = searcher.summarize(assessment)
-        payload = _assessment_payload(assessment, _figure_to_data_uri(figure), display_source or source, summary_text)
+
+        figure = searcher.build_result_figure(assessment, source_lightcurve=lightcurve)
+        fig_id = str(uuid.uuid4())[0:10]
+        figure.savefig(f"figures-dir/{fig_id}.png")
+        payload = _assessment_payload(assessment, f"{request.host_url}get-figure/{fig_id}", display_source or source, summary_text)
         return jsonify(payload)
     except Exception as exc:  # noqa: BLE001
         payload, code = _analysis_error(str(exc), 500)
@@ -193,6 +204,12 @@ def analyze():
             except OSError:
                 pass
 
+@app.get("/get-figure/<figure_id>")
+def getFigure(figure_id):
+    if os.path.exists(f"figures-dir/{figure_id}.png"):
+        return send_file(f"figures-dir/{figure_id}.png")
+    else:
+        return jsonify({"success": False, "error": f"Figure with id '{figure_id}' not found!"}), 404
 
 if __name__ == "__main__":
     app.run(debug=True)

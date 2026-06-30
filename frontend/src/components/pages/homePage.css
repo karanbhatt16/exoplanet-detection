@@ -208,10 +208,6 @@
   line-height: 1.5;
 }
 
-.hidden {
-  display: none !important;
-}
-
 .loading-panel {
   display: flex;
   align-items: center;
