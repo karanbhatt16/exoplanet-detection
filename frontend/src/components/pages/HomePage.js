@@ -69,30 +69,30 @@ function ResultSection({resultFetchStatus, analysisResult}) {
                     </div>
                 </div>
 
-                <div className="source-line" id="sourceLine">No search has been run yet.</div>
+                <div className="source-line">{analysisResult["source"] || 'No search has been run yet.'}</div>
 
                 <div className="summary-grid">
                     <div className="summary-card">
                         <span>Confidence</span>
-                        <strong id="confidenceValue">--</strong>
+                        <strong>{`${analysisResult["confidence_percent"] || '--'}%`}</strong>
                     </div>
                     <div className="summary-card">
                         <span>Period</span>
-                        <strong id="periodValue">--</strong>
+                        <strong>{`${analysisResult.candidate?.period_days || '--'} days`}</strong>
                     </div>
                     <div className="summary-card">
                         <span>Duration</span>
-                        <strong id="durationValue">--</strong>
+                        <strong>{`${analysisResult.candidate?.duration_hours || '--'} hours`}</strong>
                     </div>
                     <div className="summary-card">
                         <span>Radius</span>
-                        <strong id="radiusValue">--</strong>
+                        <strong>{analysisResult.candidate?.planet_radius_rearth || '--'}</strong>
                     </div>
                 </div>
 
                 <div className="reason-block">
                     <h3>Status</h3>
-                    <p id="resultReason">Run a search to see the closest transit candidate and the full explanation.</p>
+                    <p>{analysisResult["reason"] || 'Run a search to see the closest transit candidate and the full explanation.'}</p>
                 </div>
             </aside>
         </section>
@@ -231,12 +231,12 @@ export default function HomePage() {
                 
                 {/* <section id="errorBanner" className="panel error-panel" aria-live="assertive"></section> */}
 
-                <section id="emptyState" className="panel empty-panel">
+                {/* <section id="emptyState" className="panel empty-panel">
                     <h2>Ready when you are</h2>
                     <p>
                         Enter a TIC target ID or upload a local light curve to generate the transit dashboard and candidate summary.
                     </p>
-                </section>
+                </section> */}
 
                 {
                 Object.keys(analysisResult).length ? 
